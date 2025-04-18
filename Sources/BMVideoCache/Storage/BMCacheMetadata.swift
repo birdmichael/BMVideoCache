@@ -27,4 +27,11 @@ internal struct BMContentInfo: Codable, Equatable {
     var contentType: String
     var contentLength: Int64
     var isByteRangeAccessSupported: Bool
+
+    var isHLSContent: Bool {
+        return contentType.contains("application/vnd.apple.mpegurl") ||
+               contentType.contains("application/x-mpegurl") ||
+               contentType.contains("audio/mpegurl") ||
+               contentType.contains("audio/x-mpegurl")
+    }
 }

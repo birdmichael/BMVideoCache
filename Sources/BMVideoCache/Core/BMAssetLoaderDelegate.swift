@@ -136,6 +136,8 @@ internal final class BMDataLoader {
     private var contentType: String?
     private var isPreloading = false
     private var isCancelled = false
+    private var isHLSContent = false
+    private var hlsSegmentTasks = [URLSessionDataTask]()
     init(originalURL: URL, cacheManager: BMCacheManager, config: BMCacheConfiguration) {
         self.originalURL = originalURL
         self.cacheManager = cacheManager
@@ -184,6 +186,13 @@ internal final class BMDataLoader {
             self.isCancelled = true
             self.task?.cancel()
             self.task = nil
+
+            // 取消所有HLS分段任务
+            for segmentTask in self.hlsSegmentTasks {
+                segmentTask.cancel()
+            }
+            self.hlsSegmentTasks.removeAll()
+
             self.session?.invalidateAndCancel()
             self.session = nil
             for request in self.pendingRequests {
@@ -280,16 +289,27 @@ internal final class BMDataLoader {
             contentLength: expectedContentLength,
             isByteRangeAccessSupported: isByteRangeAccessSupported
         )
+
+        // 检查是否为HLS内容
+        isHLSContent = contentInfo.isHLSContent || originalURL.pathExtension.lowercased() == "m3u8"
+
         let key = cacheManager.cacheKeySync(for: originalURL)
         Task {
             await cacheManager.updateContentInfo(for: key, info: contentInfo)
         }
+
         if let receivedData = data {
             self.receivedData = receivedData
             self.currentOffset = Int64(receivedData.count)
             Task {
                 await cacheManager.cacheData(receivedData, for: key, at: 0)
             }
+
+            // 如果是HLS内容，解析m3u8文件并缓存分段
+            if isHLSContent, let m3u8Content = String(data: receivedData, encoding: .utf8) {
+                processHLSContent(m3u8Content)
+            }
+
             processPendingRequests()
         }
     }
@@ -332,6 +352,75 @@ internal final class BMDataLoader {
                 request.finishLoading(with: error)
             }
             self.pendingRequests.removeAll()
+        }
+    }
+
+    private func processHLSContent(_ m3u8Content: String) {
+        // 解析m3u8文件内容
+        let lines = m3u8Content.components(separatedBy: .newlines)
+        var segmentURLs: [URL] = []
+
+        // 获取m3u8文件的基础URL
+        let baseURL = originalURL.deletingLastPathComponent()
+
+        for line in lines {
+            let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // 跳过注释和标签行
+            if trimmedLine.isEmpty || trimmedLine.hasPrefix("#") {
+                continue
+            }
+
+            // 处理分段URL
+            if let segmentURL = URL(string: trimmedLine, relativeTo: baseURL) {
+                segmentURLs.append(segmentURL)
+            }
+        }
+
+        // 缓存所有分段
+        for segmentURL in segmentURLs {
+            cacheHLSSegment(segmentURL)
+        }
+    }
+
+    private func cacheHLSSegment(_ segmentURL: URL) {
+        var request = URLRequest(url: segmentURL)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        if let customHeaders = config.customHTTPHeaderFields {
+            for (field, value) in customHeaders {
+                request.setValue(value, forHTTPHeaderField: field)
+            }
+        }
+
+        let segmentTask = session?.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self, !self.isCancelled else { return }
+
+            if let error = error {
+                Task { await BMLogger.shared.error("HLS segment loading failed for URL: \(segmentURL.absoluteString), Error: \(error)") }
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse, 200...299 ~= httpResponse.statusCode else {
+                return
+            }
+
+            if let segmentData = data {
+                let key = self.cacheManager.cacheKeySync(for: segmentURL)
+                Task {
+                    // 创建分段的元数据
+                    _ = await self.cacheManager.createOrUpdateMetadata(for: key, originalURL: segmentURL)
+
+                    // 缓存分段数据
+                    await self.cacheManager.cacheData(segmentData, for: key, at: 0)
+
+                    await BMLogger.shared.debug("Cached HLS segment: \(segmentURL.lastPathComponent)")
+                }
+            }
+        }
+
+        if let task = segmentTask {
+            hlsSegmentTasks.append(task)
+            task.resume()
         }
     }
 }

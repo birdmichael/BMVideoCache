@@ -7,6 +7,7 @@ BMVideoCache是一个高性能的视频缓存和预加载库，支持iOS、macOS
 ## Features / 特性
 
 - HTTP/HTTPS video stream caching / HTTP/HTTPS视频流缓存
+- Support for MP4 and HLS (m3u8) formats / 支持MP4和HLS (m3u8)格式
 - Video preloading / 视频预加载
 - Multi-platform support: iOS, macOS, iPadOS, and visionOS / 多平台支持：iOS、macOS、iPadOS和visionOS
 - Efficient cache management / 高效缓存管理
@@ -100,6 +101,25 @@ print("Total cache size: \(stats.totalCacheSize) bytes")
 ```
 
 ## Advanced Features / 高级特性
+
+### HLS (m3u8) Support / HLS (m3u8) 支持
+
+BMVideoCache supports caching and preloading HLS (HTTP Live Streaming) content:
+
+```swift
+// 使用方式与MP4相同
+let hlsURL = URL(string: "https://example.com/video.m3u8")!
+let asset = await BMVideoCache.shared.asset(for: hlsURL)
+let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+
+// 预加载HLS内容
+await BMVideoCache.shared.preload(url: hlsURL)
+```
+
+BMVideoCache will automatically:
+- Cache the main m3u8 playlist file
+- Parse the playlist and cache all segment files (.ts files)
+- Handle all the complexity of HLS streaming for you
 
 ### Cache Priorities / 缓存优先级
 
