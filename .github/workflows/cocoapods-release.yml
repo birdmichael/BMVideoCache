@@ -1,0 +1,38 @@
+name: CocoaPods Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: '3.0'
+        bundler-cache: true
+
+    - name: Install CocoaPods
+      run: gem install cocoapods
+
+    - name: Update Podspec Version
+      run: |
+        sed -i '' "s/s.version          = ENV\['GITHUB_REF_NAME'\] || '1.0.0'/s.version          = '${{ github.ref_name }}'/g" BMVideoCache.podspec
+
+    - name: Update Source URL
+      run: |
+        sed -i '' "s|s.source           = { :git => '.', :tag => s.version.to_s }|s.source           = { :git => 'https://github.com/birdmichael/BMVideoCache.git', :tag => s.version.to_s }|g" BMVideoCache.podspec
+
+    - name: Validate Podspec
+      run: pod spec lint BMVideoCache.podspec --allow-warnings --verbose
+
+    - name: Publish to CocoaPods
+      env:
+        COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+      run: pod trunk push BMVideoCache.podspec --allow-warnings
