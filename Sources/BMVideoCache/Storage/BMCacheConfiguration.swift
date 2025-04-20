@@ -71,7 +71,8 @@ public struct BMCacheConfiguration {
         return cacheDirectoryURL.appendingPathComponent("\(key).\(cacheFileExtension)")
     }
     internal func metadataFileURL(for key: String) -> URL {
-        return cacheDirectoryURL.appendingPathComponent("\(key).\(metadataFileExtension)")
+        let metadataDir = cacheDirectoryURL.appendingPathComponent("Metadata", isDirectory: true)
+        return metadataDir.appendingPathComponent("\(key).\(metadataFileExtension)")
     }
  public enum CacheCleanupStrategy: Equatable {
     case leastRecentlyUsed
@@ -136,7 +137,7 @@ public struct BMCacheConfiguration {
             self.strategy = .priorityBased
         case .custom:
             let identifier = try container.decode(String.self, forKey: .customIdentifier)
-            
+
             let factory = BMCacheStrategyRegistry.shared.getFactory(for: identifier)
             self.strategy = .custom(identifier: identifier, comparator: { _, _ in false }, factory: factory)
         }

@@ -1,796 +1,919 @@
 import Foundation
 import Combine
 import CryptoKit
+
 public actor BMCacheManager {
-    private var statistics = BMCacheStatistics()
-    private var cleanupTimer: Task<Void, Error>?
-    private var diskSpaceMonitorTimer: Task<Void, Error>?
-    private let configuration: BMCacheConfiguration
-    private actor MetadataStore {
-        var dict: [String: BMCacheMetadata] = [:]
-        func get(_ key: String) -> BMCacheMetadata? {
-            return dict[key]
-        }
-        func set(_ metadata: BMCacheMetadata, for key: String) {
-            dict[key] = metadata
-        }
-        func remove(_ key: String) {
-            dict.removeValue(forKey: key)
-        }
-        func removeAll() {
-            dict.removeAll()
-        }
-        func getAll() -> [String: BMCacheMetadata] {
-            return dict
-        }
-        func getAllKeys() -> [String] {
-            return Array(dict.keys)
-        }
-        func getAllValues() -> [BMCacheMetadata] {
-            return Array(dict.values)
-        }
-        func count() -> Int {
-            return dict.count
-        }
-        func filter(_ isIncluded: (String, BMCacheMetadata) -> Bool) -> [String] {
-            return dict.filter(isIncluded).map { $0.key }
-        }
-    }
-    private let metadataStore = MetadataStore()
-    private let fileHandleActor = FileHandleActor()
+    // 推送式进度回调（可选） - 添加了 originalURL 参数
+    public var onProgress: ((_ key: String, _ originalURL: URL, _ progress: Double, _ currentSize: UInt64, _ totalExpected: UInt64) -> Void)?
+
+    internal let configuration: BMCacheConfiguration
     private let metadataEncoder = PropertyListEncoder()
     private let metadataDecoder = PropertyListDecoder()
     private var currentCacheSize: UInt64 = 0
     private weak var dataLoaderManager: (any BMDataLoaderManaging)?
-    actor FileHandleActor {
+    private var batchedWriteBuffer: [String: [(offset: Int64, data: Data)]] = [:]
+    private var lastBatchedWriteTime: [String: TimeInterval] = [:]
+    // 统计数据
+    private var cacheStatistics = BMCacheStatistics()
+    private var lastStatsUpdateTime: Date = .distantPast
+    private let statsDebounceInterval: TimeInterval = 3.0 // 3秒防抖间隔
+
+    private let batchWriteInterval: TimeInterval = 0.5
+    private let integrityCheckQueue = DispatchQueue(label: "com.bmvideocache.fileintegrity.queue", attributes: .concurrent)
+
+    // ================== 内部类型 ==================
+    private actor MetadataStore {
+        var dict: [String: BMCacheMetadata] = [:]
+        func get(_ key: String) -> BMCacheMetadata? { dict[key] }
+        func set(_ metadata: BMCacheMetadata, for key: String) { dict[key] = metadata }
+        func remove(_ key: String) { dict.removeValue(forKey: key) }
+        func getAllValues() -> [BMCacheMetadata] { Array(dict.values) }
+        func count() -> Int { dict.count }
+    }
+    private let metadataStore = MetadataStore()
+
+    private actor FileHandleActor {
         var handles: [String: BMFileHandleManager] = [:]
+
         func getHandle(forKey key: String, createWith fileURL: URL) async throws -> BMFileHandleManager {
-            if let existingHandle = handles[key] {
-                return existingHandle
+            if let existingHandle = handles[key] { return existingHandle }
+            let directoryURL = fileURL.deletingLastPathComponent()
+            if !FileManager.default.fileExists(atPath: directoryURL.path) {
+                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+                BMLogger.shared.debug("Created cache data directory.")
             }
             let newHandle = try BMFileHandleManager(fileURL: fileURL)
             handles[key] = newHandle
-            Task { await BMLogger.shared.debug("Created and stored new file handle for key: \(key)") }
+            BMLogger.shared.debug("Created file handle for key: \(key)")
             return newHandle
         }
+
         func removeHandle(forKey key: String) {
             if handles.removeValue(forKey: key) != nil {
-                 Task { await BMLogger.shared.debug("Removed file handle reference for key: \(key)") }
+                BMLogger.shared.debug("Removed file handle for key: \(key)")
             }
         }
-        func removeAllHandles() {
-             let count = handles.count
-             handles.removeAll()
-             Task { await BMLogger.shared.debug("Removed all (\(count)) file handle references") }
-        }
-        func getAllHandles() -> [BMFileHandleManager] {
-             return Array(handles.values)
-        }
     }
-    init(configuration: BMCacheConfiguration) {
+    private let fileHandleActor = FileHandleActor()
+
+
+    public init(configuration: BMCacheConfiguration) {
         self.configuration = configuration
+        BMLogger.shared.info("BMCacheManager initialized.")
     }
-    deinit {
-        cleanupTimer?.cancel()
-        diskSpaceMonitorTimer?.cancel()
-    }
-    static func create(configuration: BMCacheConfiguration) async -> BMCacheManager {
+
+    // MARK: - Static Factory (Simplified)
+    public static func create(configuration: BMCacheConfiguration) async -> BMCacheManager {
         let manager = BMCacheManager(configuration: configuration)
-        await manager._loadMetadataAsync()
-        await manager._calculateInitialCacheSizeAsync()
-        await manager._startTimers()
+        await manager._loadMetadataAsync() // Load existing metadata
+        await manager._calculateInitialCacheSizeAsync() // Calculate initial size
+        await manager._loadStatisticsAsync() // Load existing statistics
+        // TODO: Start cleanup/monitoring timers later
         return manager
     }
-    private func _startTimers() async {
-        cleanupTimer?.cancel()
-        diskSpaceMonitorTimer?.cancel()
-        cleanupTimer = Task.detached { [weak self] in
-            guard let self = self else { return }
-            while !Task.isCancelled {
+
+    // MARK: - Internal Setup Methods
+    private func _loadMetadataAsync() async {
+        // 使用与 saveMetadata 相同的方式获取元数据目录
+        let metadataDir = configuration.metadataFileURL(for: "dummy").deletingLastPathComponent()
+        BMLogger.shared.info("_loadMetadataAsync: 开始加载元数据目录 \(metadataDir.path)")
+
+        do {
+            // 确保元数据目录存在
+            if !FileManager.default.fileExists(atPath: metadataDir.path) {
+                try FileManager.default.createDirectory(at: metadataDir, withIntermediateDirectories: true)
+                BMLogger.shared.info("Metadata directory doesn't exist, created empty directory.")
+            }
+
+            let fileURLs = try FileManager.default.contentsOfDirectory(at: metadataDir, includingPropertiesForKeys: nil)
+            let metadataFiles = fileURLs.filter { $0.pathExtension == configuration.metadataFileExtension }
+
+            guard !metadataFiles.isEmpty else {
+                BMLogger.shared.info("No existing metadata files found.")
+                return
+            }
+
+            var loadedCount = 0
+            var validatedCount = 0
+            for fileURL in metadataFiles {
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(self.configuration.cleanupInterval * 1_000_000_000))
-                    if !Task.isCancelled {
-                        await self.performScheduledCleanup()
+                    let data = try Data(contentsOf: fileURL)
+                    var metadata = try self.metadataDecoder.decode(BMCacheMetadata.self, from: data)
+                    let key = fileURL.deletingPathExtension().lastPathComponent
+                    // 修正 cacheKey
+                    metadata = BMCacheMetadata(cacheKey: key, originalURL: metadata.originalURL, contentInfo: metadata.contentInfo)
+
+                    // 验证缓存文件是否存在并更新元数据
+                    let cacheFileURL = configuration.cacheFileURL(for: key)
+                    if FileManager.default.fileExists(atPath: cacheFileURL.path) {
+                        // 获取实际文件大小
+                        if let attrs = try? FileManager.default.attributesOfItem(atPath: cacheFileURL.path),
+                           let fileSize = attrs[.size] as? UInt64 {
+
+                            // 如果文件存在但元数据不完整，更新元数据
+                            if !metadata.isComplete || metadata.totalCachedSize != fileSize {
+                                metadata.isComplete = true
+                                metadata.totalCachedSize = fileSize
+
+                                // 如果没有内容长度信息，添加它
+                                if metadata.contentInfo == nil || metadata.contentInfo?.contentLength == 0 {
+                                    metadata.contentInfo = BMContentInfo(
+                                        contentType: "video/mp4",
+                                        contentLength: Int64(fileSize),
+                                        isByteRangeAccessSupported: true
+                                    )
+                                }
+
+                                // 更新缓存范围
+                                if metadata.cachedRanges.isEmpty && fileSize > 0 {
+                                    metadata.cachedRanges = [ClosedRange(uncheckedBounds: (lower: 0, upper: Int64(fileSize) - 1))]
+                                }
+
+                                // 保存更新后的元数据
+                                try? self.metadataEncoder.encode(metadata).write(to: fileURL, options: .atomic)
+                                BMLogger.shared.info("Updated metadata for existing file: \(key), size: \(fileSize)")
+                            }
+                            validatedCount += 1
+                        } else {
+                            BMLogger.shared.warning("File exists but couldn't get size for: \(cacheFileURL.path)")
+                        }
+                    } else if metadata.isComplete {
+                        // 文件不存在但元数据显示完成，重置元数据
+                        metadata.isComplete = false
+                        metadata.totalCachedSize = 0
+                        metadata.cachedRanges = []
+
+                        // 保存更新后的元数据
+                        try? self.metadataEncoder.encode(metadata).write(to: fileURL, options: .atomic)
+                        BMLogger.shared.info("Reset metadata for missing file: \(key)")
                     }
+
+                    await metadataStore.set(metadata, for: key)
+                    loadedCount += 1
                 } catch {
-                    break
+                    BMLogger.shared.error("Failed to load or decode metadata file \(fileURL.lastPathComponent): \(error)")
+                    // Optionally remove corrupt metadata file
+                    // try? FileManager.default.removeItem(at: fileURL)
                 }
             }
-        }
-        diskSpaceMonitorTimer = Task.detached { [weak self] in
-            guard let self = self else { return }
-            while !Task.isCancelled {
-                do {
-                    try await Task.sleep(nanoseconds: 5 * 60 * 1_000_000_000)
-                    if !Task.isCancelled {
-                        let _ = await self.ensureMinimumDiskSpace()
-                    }
-                } catch {
-                    break
-                }
-            }
+            BMLogger.shared.info("Successfully loaded \(loadedCount) metadata entries, validated \(validatedCount) cache files.")
+
+        } catch CocoaError.fileReadNoSuchFile {
+            BMLogger.shared.info("Metadata directory doesn't exist, no metadata loaded.")
+        } catch {
+            BMLogger.shared.error("Failed to list metadata directory \(metadataDir.path): \(error)")
         }
     }
-    func setDataLoaderManager(_ manager: any BMDataLoaderManaging) {
+
+    private func _calculateInitialCacheSizeAsync() async {
+        let allMetadata = await metadataStore.getAllValues()
+        let totalSize = allMetadata.reduce(UInt64(0)) { $0 + $1.totalCachedSize }
+        self.currentCacheSize = totalSize
+        BMLogger.shared.info("Calculated initial cache size: \(totalSize) bytes from \(allMetadata.count) items.")
+    }
+
+    // 加载统计数据
+    private func _loadStatisticsAsync() async {
+        let statsFileURL = configuration.cacheDirectoryURL.appendingPathComponent("statistics.plist")
+
+        do {
+            if FileManager.default.fileExists(atPath: statsFileURL.path) {
+                let data = try Data(contentsOf: statsFileURL)
+                let loadedStats = try PropertyListDecoder().decode(BMCacheStatistics.self, from: data)
+                self.cacheStatistics = loadedStats
+                BMLogger.shared.info("Loaded cache statistics: \(loadedStats.hitCount) hits, \(loadedStats.missCount) misses")
+            } else {
+                BMLogger.shared.info("No statistics file found, using default statistics.")
+            }
+        } catch {
+            BMLogger.shared.error("Failed to load statistics: \(error)")
+        }
+    }
+
+    // 保存统计数据
+    private func _saveStatisticsAsync() async {
+        let statsFileURL = configuration.cacheDirectoryURL.appendingPathComponent("statistics.plist")
+
+        do {
+            let data = try PropertyListEncoder().encode(cacheStatistics)
+            try data.write(to: statsFileURL, options: .atomic)
+            BMLogger.shared.debug("Saved cache statistics: \(cacheStatistics.hitCount) hits, \(cacheStatistics.missCount) misses")
+        } catch {
+            BMLogger.shared.error("Failed to save statistics: \(error)")
+        }
+    }
+
+
+
+    // MARK: - Data Loader Manager Link
+    func setDataLoaderManager(_ manager: (any BMDataLoaderManaging)?) {
         self.dataLoaderManager = manager
     }
-    nonisolated func setDataLoaderManagerSync(_ manager: any BMDataLoaderManaging) {
+
+    nonisolated func setDataLoaderManagerSync(_ manager: (any BMDataLoaderManaging)?) {
         Task { await self.setDataLoaderManager(manager) }
     }
-    private func _loadMetadataAsync() async {
-        let loadedMetadata = await Task.detached(priority: .utility) { [config = self.configuration, decoder = self.metadataDecoder] () -> [String: BMCacheMetadata] in
-            var tempMetadata: [String: BMCacheMetadata] = [:]
-            let directoryURL = config.cacheDirectoryURL
-            guard let enumerator = FileManager.default.enumerator(at: directoryURL, includingPropertiesForKeys: nil, options: .skipsHiddenFiles) else {
-                Task { await BMLogger.shared.warning("Could not enumerate cache directory: \(directoryURL.path)") }
-                return [:]
-            }
-            let fileURLs = enumerator.allObjects.compactMap { $0 as? URL }
-            for fileURL in fileURLs {
-                if fileURL.pathExtension == config.metadataFileExtension {
-                    do {
-                        let data = try Data(contentsOf: fileURL)
-                        let metadata = try decoder.decode(BMCacheMetadata.self, from: data)
-                        let key = fileURL.deletingPathExtension().lastPathComponent
-                        tempMetadata[key] = metadata
-                    } catch {
-                        Task { await BMLogger.shared.error("Error loading metadata from \(fileURL.path): \(error)") }
-                    }
-                }
-            }
-            return tempMetadata
-        }.value
-        for (key, metadata) in loadedMetadata {
-            await metadataStore.set(metadata, for: key)
-        }
-        await updateStatistics()
-        let count = await metadataStore.count()
-        Task { await BMLogger.shared.info("Loaded \(count) metadata entries asynchronously.") }
-    }
-    private func _calculateInitialCacheSizeAsync() async {
-         let keys = await metadataStore.getAllKeys()
-        let size = await Task.detached(priority: .utility) { [config = self.configuration] () -> UInt64 in
-            var calculatedSize: UInt64 = 0
-            for key in keys {
-                let fileURL = config.cacheFileURL(for: key)
-                do {
-                    let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-                    calculatedSize += attributes[.size] as? UInt64 ?? 0
-                } catch {}
-            }
-            return calculatedSize
-        }.value
-        self.currentCacheSize = size
-        Task { await BMLogger.shared.info("Calculated initial cache size: \(size) bytes") }
-        let _ = await ensureCacheSizeLimitAsync()
-    }
-    internal func getFileHandle(for key: String) async -> BMFileHandleManager? {
-        let fileURL = configuration.cacheFileURL(for: key)
-        do {
-            let handle = try await fileHandleActor.getHandle(forKey: key, createWith: fileURL)
-            return handle
-        } catch {
-            Task { await BMLogger.shared.error("Failed to get or create BMFileHandleManager for key \(key): \(error)") }
-            return nil
-        }
-    }
-    private func closeFileHandle(for key: String) async {
-        await fileHandleActor.removeHandle(forKey: key)
-    }
-    func cacheData(_ data: Data, for key: String, at offset: Int64) async {
-        let newRange = ClosedRange(uncheckedBounds: (lower: offset, upper: offset + Int64(data.count) - 1))
-        guard let handle = await getFileHandle(for: key) else {
-            Task { await BMLogger.shared.warning("Failed to get file handle for key \(key) when caching data.") }
-            return
-        }
-        await handle.writeData(data, at: offset)
-        guard var metadata = await metadataStore.get(key) else {
-            Task { await BMLogger.shared.warning("Tried to cache data for key \(key) but metadata is missing.") }
-            return
-        }
-        let oldSize = metadata.estimatedFileSizeBasedOnRanges
-        var mergedRanges = metadata.cachedRanges
-        mergedRanges.append(newRange)
-        mergedRanges = self.merge(ranges: mergedRanges)
-        metadata.cachedRanges = mergedRanges
-        metadata.lastAccessDate = Date()
-        let newSize = metadata.estimatedFileSizeBasedOnRanges
-        await metadataStore.set(metadata, for: key)
-        let sizeDelta = Int64(newSize) - oldSize
-        if sizeDelta != 0 {
-            if sizeDelta > 0 {
-                self.currentCacheSize += UInt64(sizeDelta)
-            } else {
-                let reduction = UInt64(-sizeDelta)
-                self.currentCacheSize = (self.currentCacheSize >= reduction) ? self.currentCacheSize - reduction : 0
-                if sizeDelta < 0 {
-                    Task { await BMLogger.shared.debug("Cache size delta negative (\(sizeDelta)), reduction applied.") }
-                }
-            }
-        }
-        await self.saveMetadata(for: key)
-        let _ = await ensureCacheSizeLimitAsync()
-    }
-    func readData(for key: String, range: ClosedRange<Int64>) async -> Data? {
-        guard let handle = await self.getFileHandle(for: key) else {
-            Task { await BMLogger.shared.error("Read data failed: Could not get file handle for key \(key)") }
-            statistics.missCount += 1
-            return nil
-        }
-        let data = await handle.readData(offset: range.lowerBound, length: Int(range.upperBound - range.lowerBound + 1))
-        if data != nil {
-            if var meta = await metadataStore.get(key) {
-                meta.lastAccessDate = Date()
-                meta.accessCount += 1
-                await metadataStore.set(meta, for: key)
-                statistics.hitCount += 1
-            } else {
-                Task { await BMLogger.shared.warning("Metadata not found for key \(key) during access date update.") }
-                statistics.missCount += 1
-            }
-        } else {
-            statistics.missCount += 1
-        }
-        return data
-    }
-    private func ensureCacheSizeLimitAsync() async -> UInt64 {
-        if self.currentCacheSize > self.configuration.maxCacheSizeInBytes {
-            Task { await BMLogger.shared.info("Cache size \(self.currentCacheSize) exceeds limit \(self.configuration.maxCacheSizeInBytes). Starting eviction.") }
-            return await _evictItemsToMeetSizeLimit()
-        }
-        return 0
-    }
-    private func _evictItemsToMeetSizeLimit() async -> UInt64 {
-        let sizeLimit = configuration.maxCacheSizeInBytes
-        guard currentCacheSize > sizeLimit else { return 0 }
-        var itemsToEvict = await getSortedItemsForEviction()
-        var sizeToFree = currentCacheSize - sizeLimit
-        var freedSize: UInt64 = 0
-        while sizeToFree > 0 && !itemsToEvict.isEmpty {
-            let item = itemsToEvict.removeFirst()
-            let key = self.cacheKey(for: item.originalURL)
-            let itemSize = UInt64(clamping: item.estimatedFileSizeBasedOnRanges)
-            if self.dataLoaderManager?.isLoaderActive(forKey: key) == true {
-                Task { await BMLogger.shared.debug("Skipping eviction for active key: \(key)") }
-                continue
-            }
-            if item.priority == .permanent {
-                Task { await BMLogger.shared.debug("Skipping eviction for permanent item: \(key)") }
-                continue
-            }
-            await metadataStore.remove(key)
-            await fileHandleActor.removeHandle(forKey: key)
-            Task { await BMLogger.shared.info("Evicting key: \(key), Size: \(itemSize)") }
-            Task.detached {
-                let cacheFileURL = self.configuration.cacheFileURL(for: key)
-                let metadataFileURL = self.configuration.metadataFileURL(for: key)
-                do {
-                    try FileManager.default.removeItem(at: cacheFileURL)
-                    try FileManager.default.removeItem(at: metadataFileURL)
-                    Task { await BMLogger.shared.debug("Deleted files for evicted key: \(key)") }
-                } catch {
-                    Task { await BMLogger.shared.error("Error deleting files for evicted key \(key): \(error)") }
-                }
-            }
-            freedSize += itemSize
-            sizeToFree = (sizeToFree > itemSize) ? sizeToFree - itemSize : UInt64(0)
-        }
-        currentCacheSize = (currentCacheSize >= freedSize) ? currentCacheSize - freedSize : 0
-        await updateStatistics()
-        Task { await BMLogger.shared.info("Eviction completed. Freed \(freedSize) bytes. New size: \(currentCacheSize)") }
-        return freedSize
-    }
-    func clearAllCache() async {
-         let handlesToClear = await fileHandleActor.getAllHandles()
-         await fileHandleActor.removeAllHandles()
-         await metadataStore.removeAll()
-         self.currentCacheSize = 0
-         Task { await BMLogger.shared.info("Cleared in-memory cache state.") }
-         _ = handlesToClear
-        Task.detached(priority: .utility) { [config = self.configuration] in
-             do {
-                 let directoryURL = config.cacheDirectoryURL
-                 if FileManager.default.fileExists(atPath: directoryURL.path) {
-                     let fileURLs = try FileManager.default.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: nil)
-                     for fileURL in fileURLs {
-                         try FileManager.default.removeItem(at: fileURL)
-                     }
-                     Task { await BMLogger.shared.info("Deleted all files from cache directory: \(directoryURL.path)") }
-                 } else {
-                     Task { await BMLogger.shared.debug("Cache directory does not exist, skipping deletion: \(directoryURL.path)") }
-                 }
-             } catch {
-                 Task { await BMLogger.shared.error("Error clearing cache directory \(config.cacheDirectoryURL.path): \(error)") }
-             }
-         }
-    }
-    func getMetadata(for key: String) async -> BMCacheMetadata? {
-        return await metadataStore.get(key)
-    }
-    nonisolated func getMetadataSync(for key: String) -> BMCacheMetadata? {
-        let semaphore = DispatchSemaphore(value: 0)
-        let resultBox = AtomicBox<BMCacheMetadata?>(nil)
 
-        Task {
-            let metadata = await self.getMetadata(for: key)
-            resultBox.set(metadata)
-            semaphore.signal()
-        }
-
-        semaphore.wait()
-        return resultBox.get()
-    }
-
-    private class AtomicBox<T> {
-        private let lock = NSLock()
-        private var value: T
-
-        init(_ initialValue: T) {
-            self.value = initialValue
-        }
-
-        func get() -> T {
-            lock.lock()
-            defer { lock.unlock() }
-            return value
-        }
-
-        func set(_ newValue: T) {
-            lock.lock()
-            defer { lock.unlock() }
-            value = newValue
-        }
-    }
-    func getContentInfo(for key: String) async -> BMContentInfo? {
-        return await metadataStore.get(key)?.contentInfo
-    }
-    func updateContentInfo(for key: String, info: BMContentInfo) async {
-        if var metadata = await metadataStore.get(key) {
-            metadata.contentInfo = info
-            metadata.lastAccessDate = Date()
-            await metadataStore.set(metadata, for: key)
-            await self.saveMetadata(for: key)
-        }
-    }
-    func createOrUpdateMetadata(for key: String, originalURL: URL, updateAccessTime: Bool = false) async -> BMCacheMetadata {
-        if var metadata = await metadataStore.get(key) {
-            if updateAccessTime { metadata.lastAccessDate = Date() }
-            await metadataStore.set(metadata, for: key)
-            await self.saveMetadata(for: key)
-            return metadata
-        } else {
-            let newMetadata = BMCacheMetadata(originalURL: originalURL)
-            await metadataStore.set(newMetadata, for: key)
-            await self.saveMetadata(for: key)
-            return newMetadata
-        }
-    }
-    nonisolated func createOrUpdateMetadataSync(for key: String, originalURL: URL, updateAccessTime: Bool = false) -> BMCacheMetadata {
-        let newMetadata = BMCacheMetadata(originalURL: originalURL)
-        Task {
-            _ = await self.createOrUpdateMetadata(for: key, originalURL: originalURL, updateAccessTime: updateAccessTime)
-        }
-        return newMetadata
-    }
-    private func saveMetadata(for key: String) async {
-        guard let metadata = await metadataStore.get(key) else { return }
-        let fileURL = configuration.metadataFileURL(for: key)
-        Task.detached {
-            do {
-                let data = try self.metadataEncoder.encode(metadata)
-                try data.write(to: fileURL, options: .atomic)
-                Task { await BMLogger.shared.debug("Saved metadata for key: \(key)") }
-            } catch {
-                Task { await BMLogger.shared.error("Error saving metadata for key \(key): \(error)") }
-            }
-        }
-    }
-    func getCachedRanges(for key: String) async -> [ClosedRange<Int64>] {
-        return await metadataStore.get(key)?.cachedRanges ?? []
-    }
-    func getCurrentCacheSize() -> UInt64 {
-        return currentCacheSize
-    }
-    func cacheKey(for url: URL) -> String {
+    // MARK: - Cache Key
+    public func cacheKey(for url: URL) -> String {
         if let customKeyNamer = configuration.cacheKeyNamer {
             return customKeyNamer(url)
         } else {
-            let inputData = Data(url.absoluteString.utf8)
-            let hashed = SHA256.hash(data: inputData)
-            return hashed.compactMap { String(format: "%02x", $0) }.joined()
+            return BMCacheManager.generateCacheKey(for: url)
         }
     }
+
     nonisolated func cacheKeySync(for url: URL) -> String {
+        return BMCacheManager.generateCacheKey(for: url)
+    }
+
+    // MARK: - Static Utility Methods
+    public static func generateCacheKey(for url: URL) -> String {
         let inputData = Data(url.absoluteString.utf8)
         let hashed = SHA256.hash(data: inputData)
         return hashed.compactMap { String(format: "%02x", $0) }.joined()
     }
-    func preloadData(for url: URL, length: Int64) async {
-         let startTime = Date()
-         let key = cacheKey(for: url)
-         Task { await BMLogger.shared.info("Preload requested for key: \(key), URL: \(url.lastPathComponent)") }
-         _ = await createOrUpdateMetadata(for: key, originalURL: url)
-         await dataLoaderManager?.startPreload(forKey: key, length: length)
-         let elapsedTime = Date().timeIntervalSince(startTime) * 1000
-         Task { await BMLogger.shared.performance("Preload initiation for \(url.lastPathComponent)", durationMs: elapsedTime) }
-     }
-    private func getSortedItemsForEviction() async -> [BMCacheMetadata] {
-        let now = Date()
-        let allMetadata = await metadataStore.getAllValues()
-        let expiredItems = allMetadata.filter { metadata in
-            if let expirationDate = metadata.expirationDate, expirationDate < now {
-                return metadata.priority != .permanent
-            }
-            return false
-        }
-        if !expiredItems.isEmpty {
-            return expiredItems.sorted { $0.lastAccessDate < $1.lastAccessDate }
-        }
-        switch configuration.cleanupStrategy {
-        case .leastRecentlyUsed:
-            return allMetadata
-                .filter { $0.priority != .permanent }
-                .sorted { $0.lastAccessDate < $1.lastAccessDate }
-        case .leastFrequentlyUsed:
-            return allMetadata
-                .filter { $0.priority != .permanent }
-                .sorted { $0.accessCount < $1.accessCount }
-        case .firstInFirstOut:
-            return allMetadata
-                .filter { $0.priority != .permanent }
-                .sorted { $0.lastAccessDate < $1.lastAccessDate }
-        case .expired:
-            return []
-        case .priorityBased:
-            return allMetadata
-                .filter { $0.priority != .permanent }
-                .sorted { $0.priority < $1.priority ||
-                         ($0.priority == $1.priority && $0.lastAccessDate < $1.lastAccessDate) }
-        case .custom(_, let comparator, _):
 
-            let actualComparator = configuration.cleanupStrategy.getComparator() ?? comparator
-            return allMetadata
-                .filter { $0.priority != .permanent }
-                .sorted { actualComparator($0.originalURL, $1.originalURL) }
+    public static func merge(ranges: [ClosedRange<Int64>]) -> [ClosedRange<Int64>] {
+        return BMCacheMetadata.mergeRanges(ranges)
+    }
+
+    // MARK: - Metadata Access & Management
+    public func getMetadata(for key: String) async -> BMCacheMetadata? {
+        let metaFilePath = configuration.metadataFileURL(for: key).path
+        if await metadataStore.get(key) != nil {
+            BMLogger.shared.debug("getMetadata: 命中 key=\(key), 路径=\(metaFilePath)")
+        } else {
+            BMLogger.shared.warning("getMetadata: 未命中 key=\(key), 路径=\(metaFilePath)")
+        }
+        return await metadataStore.get(key)
+    }
+
+    // NOTE: Sync versions involving actors are complex. Prefer async.
+    nonisolated func getMetadataSync(for key: String) -> BMCacheMetadata? {
+        var result: BMCacheMetadata? = nil
+        let group = DispatchGroup()
+        group.enter()
+        Task {
+            result = await getMetadata(for: key)
+            group.leave()
+        }
+        group.wait()
+        return result
+    }
+
+    public func createOrUpdateMetadata(for key: String, originalURL: URL, updateAccessTime: Bool = false) async -> BMCacheMetadata {
+        let metaFilePath = configuration.metadataFileURL(for: key).path
+        if var metadata = await metadataStore.get(key) {
+            if updateAccessTime { metadata.lastAccessDate = Date() }
+            await metadataStore.set(metadata, for: key)
+            await saveMetadata(for: key)
+            BMLogger.shared.info("createOrUpdateMetadata: 已更新 key=\(key), 路径=\(metaFilePath)")
+            return metadata
+        } else {
+            let newMetadata = BMCacheMetadata(cacheKey: key, originalURL: originalURL)
+            await metadataStore.set(newMetadata, for: key)
+            await saveMetadata(for: key)
+            BMLogger.shared.info("createOrUpdateMetadata: 已新建 key=\(key), 路径=\(metaFilePath)")
+            return newMetadata
         }
     }
-    private func performScheduledCleanup() async {
-        let startTime = Date()
-        var freedBytes: UInt64 = 0
 
-        let expiredFreed = await cleanExpiredItems()
-        freedBytes += expiredFreed
-
-        let sizeFreed = await ensureCacheSizeLimitAsync()
-        freedBytes += sizeFreed
-
-        let diskFreed = await ensureMinimumDiskSpace()
-        freedBytes += diskFreed
-
-        statistics.lastCleanupTime = Date()
-        statistics.lastCleanupFreedBytes = freedBytes
-
-        await updateStatistics()
-        let duration = Date().timeIntervalSince(startTime) * 1000
-        Task { await BMLogger.shared.performance("Cache cleanup", durationMs: duration) }
+     // NOTE: Sync versions involving actors are complex. Prefer async.
+    nonisolated func createOrUpdateMetadataSync(for key: String, originalURL: URL, updateAccessTime: Bool = false) -> BMCacheMetadata {
+        let newMetadata = BMCacheMetadata(cacheKey: key, originalURL: originalURL)
+        Task {
+             _ = await createOrUpdateMetadata(for: key, originalURL: originalURL, updateAccessTime: updateAccessTime)
+        }
+        return newMetadata // Returns potentially before async completes
     }
-    private func cleanExpiredItems() async -> UInt64 {
-        let now = Date()
-        var expiredKeys = [String]()
 
-        let allMetadata = await metadataStore.getAll()
-
-        for (key, metadata) in allMetadata {
-            if let expirationDate = metadata.expirationDate,
-               expirationDate < now,
-               metadata.priority != .permanent {
-                expiredKeys.append(key)
-            }
+    private func saveMetadata(for key: String) async {
+        guard let metadata = await metadataStore.get(key) else {
+            let metaFilePath = configuration.metadataFileURL(for: key).path
+            BMLogger.shared.error("saveMetadata: 未找到内存元数据 key=\(key), 路径=\(metaFilePath)")
+            return
         }
-        var freedSize: UInt64 = 0
-        for key in expiredKeys {
-            if self.dataLoaderManager?.isLoaderActive(forKey: key) == true {
-                continue
-            }
-            if let metadata = await metadataStore.get(key) {
-                let itemSize = UInt64(clamping: metadata.estimatedFileSizeBasedOnRanges)
-                freedSize += itemSize
-            }
-            await metadataStore.remove(key)
-            await fileHandleActor.removeHandle(forKey: key)
-
-            let cacheFileURL = self.configuration.cacheFileURL(for: key)
-            let metadataFileURL = self.configuration.metadataFileURL(for: key)
-            Task { await BMFileOperationBatcher.shared.queueFilesForDeletion(cacheFile: cacheFileURL, metadataFile: metadataFileURL, key: key) }
-        }
-        if freedSize > 0 {
-            currentCacheSize = (currentCacheSize >= freedSize) ? currentCacheSize - freedSize : 0
-            let localExpiredKeysCount = expiredKeys.count
-            let localFreedSize = freedSize
-            Task { await BMLogger.shared.info("Cleaned \(localExpiredKeysCount) expired items, freed \(localFreedSize) bytes.") }
-        }
-        return freedSize
-    }
-    private func ensureMinimumDiskSpace() async -> UInt64 {
-        let requiredSpace = configuration.minimumDiskSpaceForCaching
+        let fileURL = configuration.metadataFileURL(for: key)
+        let directoryURL = fileURL.deletingLastPathComponent()
         do {
-            let volumeURL = configuration.cacheDirectoryURL.deletingLastPathComponent()
-            let values = try volumeURL.resourceValues(forKeys: [.volumeAvailableCapacityKey])
-            if let availableSpace = values.volumeAvailableCapacity,
-               UInt64(availableSpace) < requiredSpace {
-                let spaceToFree = requiredSpace - UInt64(availableSpace)
-                Task { await BMLogger.shared.warning("Low disk space: \(availableSpace) bytes available, need to free \(spaceToFree) bytes") }
-                var itemsToEvict = await getSortedItemsForEviction()
-                var freedSpace: UInt64 = 0
-                while freedSpace < spaceToFree && !itemsToEvict.isEmpty {
-                    let item = itemsToEvict.removeFirst()
-                    let key = self.cacheKey(for: item.originalURL)
-                    if self.dataLoaderManager?.isLoaderActive(forKey: key) == true {
-                        continue
-                    }
-                    if item.priority == .permanent {
-                        continue
-                    }
-                    let itemSize = UInt64(clamping: item.estimatedFileSizeBasedOnRanges)
-                    await metadataStore.remove(key)
-                    await fileHandleActor.removeHandle(forKey: key)
-                    let cacheFileURL = self.configuration.cacheFileURL(for: key)
-                    let metadataFileURL = self.configuration.metadataFileURL(for: key)
-                    Task { await BMFileOperationBatcher.shared.queueFilesForDeletion(cacheFile: cacheFileURL, metadataFile: metadataFileURL, key: key) }
-                    freedSpace += itemSize
-                    currentCacheSize = (currentCacheSize >= itemSize) ? currentCacheSize - itemSize : 0
-                }
-                let localFreedSpace = freedSpace
-                Task { await BMLogger.shared.info("Disk space cleanup completed. Freed \(localFreedSpace) bytes.") }
-                return freedSpace
+            // 确保元数据目录存在
+            if !FileManager.default.fileExists(atPath: directoryURL.path) {
+                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+                BMLogger.shared.debug("Created metadata directory: \(directoryURL.path)")
+            }
+
+            // 编码并保存元数据
+            let data = try self.metadataEncoder.encode(metadata)
+            try data.write(to: fileURL, options: .atomic)
+            BMLogger.shared.debug("saveMetadata: 已保存 key=\(key), 路径=\(fileURL.path)")
+
+            // 验证元数据文件是否存在
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                BMLogger.shared.debug("saveMetadata: 验证成功，元数据文件已存在 key=\(key)")
+            } else {
+                BMLogger.shared.error("saveMetadata: 验证失败，元数据文件不存在 key=\(key)")
             }
         } catch {
-            Task { await BMLogger.shared.error("Failed to check available disk space: \(error)") }
+            BMLogger.shared.error("saveMetadata: 保存失败 key=\(key), 路径=\(fileURL.path), error=\(error)")
         }
+    }
+
+    // MARK: - Data Operations (Minimal Placeholders)
+    /// 删除指定 key 的缓存文件和元数据，并更新缓存大小
+    public func removeCache(for key: String) async -> Bool {
+        // 删除缓存文件
+        let fileURL = configuration.cacheFileURL(for: key)
+        var fileRemoved = false
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            do {
+                let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+                let fileSize = (attrs[.size] as? UInt64) ?? 0
+                try FileManager.default.removeItem(at: fileURL)
+                // 安全地减少缓存大小
+                currentCacheSize = currentCacheSize > fileSize ? currentCacheSize - fileSize : 0
+                fileRemoved = true
+                BMLogger.shared.info("removeCache: 已删除缓存文件 key=\(key), 路径=\(fileURL.path)")
+            } catch {
+                BMLogger.shared.error("removeCache: 删除缓存文件失败 key=\(key), 路径=\(fileURL.path), error=\(error)")
+            }
+        } else {
+            BMLogger.shared.debug("removeCache: 缓存文件不存在 key=\(key), 路径=\(fileURL.path)")
+        }
+        // 删除元数据
+        await metadataStore.remove(key)
+        let metaURL = configuration.metadataFileURL(for: key)
+        if FileManager.default.fileExists(atPath: metaURL.path) {
+            do {
+                try FileManager.default.removeItem(at: metaURL)
+                BMLogger.shared.info("removeCache: 已删除元数据文件 key=\(key), 路径=\(metaURL.path)")
+            } catch {
+                BMLogger.shared.error("removeCache: 删除元数据文件失败 key=\(key), 路径=\(metaURL.path), error=\(error)")
+            }
+        } else {
+            BMLogger.shared.debug("removeCache: 元数据文件不存在 key=\(key), 路径=\(metaURL.path)")
+        }
+        // 移除文件句柄
+        await fileHandleActor.removeHandle(forKey: key)
+        return fileRemoved
+    }
+    public func cacheData(_ data: Data, for key: String, at offset: Int64, maxCacheSizeInBytes: UInt64) async {
+        guard !data.isEmpty else {
+            BMLogger.shared.warning("尝试缓存空数据 key=\(key)")
+            return
+        }
+        let fileURL = configuration.cacheFileURL(for: key)
+        
+        if await metadataStore.get(key) == nil {
+            _ = await createOrUpdateMetadata(for: key, originalURL: URL(string: "unknown://")!, updateAccessTime: true)
+        }
+
+        if var metadata = await metadataStore.get(key) {
+            let newRange = ClosedRange(uncheckedBounds: (lower: offset, upper: offset + Int64(data.count) - 1))
+            metadata.addCachedRange(newRange)
+            await metadataStore.set(metadata, for: key)
+        }
+
+        await addToBatchBuffer(key: key, data: data, offset: offset)
+        
+        let currentTime = Date().timeIntervalSince1970
+        let lastWriteTime = lastBatchedWriteTime[key] ?? 0
+        
+        if currentTime - lastWriteTime >= batchWriteInterval {
+            await processBatchedWritesForKey(key, fileURL: fileURL)
+        }
+        
+        if var metadata = await metadataStore.get(key) {
+            let newRange = ClosedRange(uncheckedBounds: (lower: offset, upper: offset + Int64(data.count) - 1))
+            do {
+                let sizeBefore = metadata.totalCachedSize
+                metadata.addCachedRange(newRange)
+                let sizeAfter = metadata.totalCachedSize
+                let sizeIncrease = sizeAfter - sizeBefore
+                
+                // 安全检查以避免整数溢出
+                if sizeIncrease > 0 && sizeIncrease <= 1024*1024*1024 { // 不超过1GB的增量
+                    self.currentCacheSize += sizeIncrease
+                }
+            } catch {
+                BMLogger.shared.error("缓存数据时处理元数据范围失败: \(error)")
+            }
+
+            await metadataStore.set(metadata, for: key)
+            await saveMetadata(for: key)
+
+            if let contentInfo = metadata.contentInfo, contentInfo.contentLength > 0 {
+                let totalExpected = UInt64(contentInfo.contentLength)
+                let currentSize = metadata.totalCachedSize
+                let progress = totalExpected > 0 ? (Double(currentSize) / Double(totalExpected) * 100.0) : 0.0
+                let originalURL = metadata.originalURL
+                
+                if let onProgress = self.onProgress {
+                    onProgress(key, originalURL, progress, currentSize, totalExpected)
+                }
+            }
+
+            await _checkCacheSizeLimit(maxSizeBytes: maxCacheSizeInBytes)
+            let fileExists = FileManager.default.fileExists(atPath: fileURL.path)
+            if fileExists, let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path), let fileSize = attrs[.size] as? UInt64 {
+                // 如果文件大小等于已知 contentLength 或大于0且覆盖全部范围，则自动标记完成
+                // 即使文件大小为0，也更新元数据
+                if let contentLength = metadata.contentInfo?.contentLength, UInt64(contentLength) <= fileSize {
+                    await markComplete(for: key, expectedSize: fileSize)
+                    BMLogger.shared.info("Auto-marked complete for key: \(key), size: \(fileSize)")
+                } else if metadata.contentInfo?.contentLength == nil {
+                    await markComplete(for: key, expectedSize: fileSize)
+                    BMLogger.shared.info("Auto-marked complete for key: \(key), size: \(fileSize) (no content length)")
+                }
+            }
+
+            // Check cache limits after writing
+            await _checkCacheSizeLimit(maxSizeBytes: maxCacheSizeInBytes) // Use passed-in value
+        }
+    }
+
+    public func readData(for key: String, range: ClosedRange<Int64>) async -> Data? {
+        // Placeholder: Get metadata, check if range is cached, get handle, read data
+        BMLogger.shared.info("Read data placeholder for key: \(key)")
+        guard let metadata = await getMetadata(for: key) else {
+            BMLogger.shared.warning("Read failed: Metadata missing for key \(key)")
+            return nil
+        }
+
+        // Basic range check (needs refinement for partial overlaps)
+        let isHit = metadata.cachedRanges.contains { $0.contains(range.lowerBound) && $0.contains(range.upperBound) }
+        guard isHit else {
+            BMLogger.shared.debug("Read miss: Range \(range) not fully cached for key \(key)")
+            return nil
+        }
+
+        do {
+            let fileURL = configuration.cacheFileURL(for: key)
+            let handle = try await fileHandleActor.getHandle(forKey: key, createWith: fileURL)
+            let data = await handle.readData(offset: range.lowerBound, length: Int(range.count))
+
+            // Update access time if read successful
+            if data != nil {
+                var updatedMeta = metadata
+                updatedMeta.lastAccessDate = Date() // Update access time when info is updated
+                updatedMeta.accessCount += 1
+                await metadataStore.set(updatedMeta, for: key)
+                // No need to save metadata just for access time usually, unless required
+            }
+            return data
+        } catch {
+            BMLogger.shared.error("Read failed for key \(key): \(error)")
+            return nil
+        }
+    }
+
+    public func preloadData(for url: URL, length: Int64) async {
+        // Placeholder: Create metadata, trigger dataLoaderManager
+        let key = cacheKey(for: url)
+        BMLogger.shared.info("Preload placeholder for key: \(key)")
+        _ = await createOrUpdateMetadata(for: key, originalURL: url)
+    }
+
+    public func clearAllCache() async {
+        BMLogger.shared.info("Clearing in-memory cache state.")
+
+        // 1. 清除内存中的元数据
+        let allMetadata = await metadataStore.getAllValues()
+        for metadata in allMetadata {
+            await metadataStore.remove(metadata.cacheKey)
+            await fileHandleActor.removeHandle(forKey: metadata.cacheKey)
+        }
+
+        // 2. 重置缓存大小
+        currentCacheSize = 0
+
+        // 3. 删除缓存目录中的所有文件
+        do {
+            // 清除主缓存目录
+            let cacheDir = configuration.cacheDirectoryURL
+            if FileManager.default.fileExists(atPath: cacheDir.path) {
+                let contents = try FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)
+                for fileURL in contents {
+                    // 跳过Metadata目录，我们将单独处理它
+                    if fileURL.lastPathComponent != "Metadata" {
+                        try FileManager.default.removeItem(at: fileURL)
+                    }
+                }
+                BMLogger.shared.info("Deleted all files from main cache directory: \(cacheDir.path)")
+            }
+
+            // 清除元数据目录
+            let metadataDir = configuration.metadataFileURL(for: "dummy").deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: metadataDir.path) {
+                let metadataContents = try FileManager.default.contentsOfDirectory(at: metadataDir, includingPropertiesForKeys: nil)
+                for fileURL in metadataContents {
+                    try FileManager.default.removeItem(at: fileURL)
+                }
+                BMLogger.shared.info("Deleted all files from metadata directory: \(metadataDir.path)")
+            }
+        } catch {
+            BMLogger.shared.error("Error clearing cache directories: \(error)")
+        }
+    }
+
+    public func clearAllExceptActiveCache() async {
+        BMLogger.shared.warning("Clearing all except active cache due to critical memory pressure.")
+
+        // 获取所有元数据
+        let allMetadata = await metadataStore.getAllValues()
+        var removedCount = 0
+
+        // 只保留正在使用的缓存项
+        for metadata in allMetadata {
+            // 如果不是活跃项（这里简单实现，可以根据需要扩展判断逻辑）
+            if metadata.accessCount < 5 && !metadata.isComplete {
+                let key = metadata.cacheKey
+                let removed = await removeCache(for: key)
+                if removed {
+                    removedCount += 1
+                }
+            }
+        }
+
+        if removedCount == 0 {
+            BMLogger.shared.info("No items to clear in critical cleanup.")
+        }
+    }
+
+    // MARK: - Getters (Placeholders)
+    public func getCachedRanges(for key: String) async -> [ClosedRange<Int64>] {
+        await metadataStore.get(key)?.cachedRanges ?? []
+    }
+
+    public func getContentInfo(for key: String) async -> BMContentInfo? {
+        await metadataStore.get(key)?.contentInfo
+    }
+
+    public func getCurrentCacheSize() -> UInt64 {
+        return currentCacheSize
+    }
+
+    public func getFileURL(for key: String) async -> URL {
+        return configuration.cacheFileURL(for: key)
+    }
+
+    // MARK: - Statistics
+    // 更新缓存命中率统计
+    public func updateCacheHitStatistics(isHit: Bool) async {
+        if isHit {
+            cacheStatistics.hitCount += 1
+        } else {
+            cacheStatistics.missCount += 1
+        }
+        // 保存统计数据
+        await _saveStatisticsAsync()
+    }
+
+    public func getStatistics() async -> BMCacheStatistics {
+        // 获取所有元数据
+        let allMetadata = await metadataStore.getAllValues()
+
+        // 使用已持久化的统计数据作为基础
+        var stats = self.cacheStatistics
+
+        // 计算基本统计信息
+        stats.totalItemCount = allMetadata.count
+
+        // 重新计算缓存大小，而不是使用currentCacheSize
+        var calculatedSize: UInt64 = 0
+        for metadata in allMetadata {
+            let fileURL = configuration.cacheFileURL(for: metadata.cacheKey)
+            if FileManager.default.fileExists(atPath: fileURL.path),
+               let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+               let fileSize = attrs[.size] as? UInt64 {
+                calculatedSize += fileSize
+            }
+        }
+        stats.totalCacheSize = calculatedSize
+
+        // 更新currentCacheSize以保持一致性
+        currentCacheSize = calculatedSize
+
+        // 如果没有缓存项，直接返回
+        if allMetadata.isEmpty {
+            // 保存更新后的统计数据
+            self.cacheStatistics = stats
+            Task { await _saveStatisticsAsync() }
+            return stats
+        }
+
+        // 计算日期相关统计
+        let accessDates = allMetadata.map { $0.lastAccessDate }
+        stats.oldestItemDate = accessDates.min()
+        stats.newestItemDate = accessDates.max()
+
+        // 计算优先级统计
+        var priorityCounts: [CachePriority: Int] = [:]
+        for metadata in allMetadata {
+            priorityCounts[metadata.priority, default: 0] += 1
+        }
+        stats.itemsByPriority = priorityCounts
+
+        // 计算过期项目数量
+        let now = Date()
+        let expiredCount = allMetadata.filter { metadata in
+            if let expiryDate = metadata.expirationDate {
+                return expiryDate < now
+            }
+            return false
+        }.count
+        stats.expiredItemCount = expiredCount
+
+        // 计算平均项目大小
+        if !allMetadata.isEmpty {
+            stats.averageItemSize = stats.totalCacheSize / UInt64(allMetadata.count)
+        }
+
+        // 计算利用率
+        let maxSize = configuration.maxCacheSizeInBytes
+        if maxSize > 0 {
+            stats.utilizationRate = Double(stats.totalCacheSize) / Double(maxSize)
+        }
+
+        // 保存更新后的统计数据
+        self.cacheStatistics = stats
+        
+        // 使用简化的防抖逻辑避免频繁保存统计数据
+        // 使用上面已经声明的now变量，不重复声明
+        if now.timeIntervalSince(lastStatsUpdateTime) > statsDebounceInterval {
+            lastStatsUpdateTime = now
+            // 延迟保存使用定时器而非 Task
+            Task {
+                await self._saveStatisticsAsync()
+            }
+        }
+
+        // 返回统计结果
+        BMLogger.shared.debug("Generated cache statistics: \(stats.totalItemCount) items, \(stats.totalCacheSize) bytes")
+        return stats
+    }
+
+    // MARK: - Priority & Expiration Management (Placeholders)
+    public func setCachePriority(for url: URL, priority: CachePriority) async {
+        let key = cacheKey(for: url)
+        BMLogger.shared.info("Placeholder: setCachePriority for key \(key)")
+        // TODO: Implement priority setting logic
+    }
+
+    public func setExpirationDate(for url: URL, date: Date?) async {
+        let key = cacheKey(for: url)
+        BMLogger.shared.info("Placeholder: setExpirationDate for key \(key)")
+        // TODO: Implement expiration setting logic
+    }
+
+    public func updateContentInfo(for key: String, info: BMContentInfo) async {
+         if var metadata = await metadataStore.get(key) {
+             metadata.contentInfo = info
+             metadata.lastAccessDate = Date()
+             await metadataStore.set(metadata, for: key)
+             await saveMetadata(for: key)
+         }
+    }
+
+    // MARK: - Completion Marking
+    public func markComplete(for key: String, expectedSize: UInt64?) async {
+        await processBatchedWrites()
+        
+        if var metadata = await metadataStore.get(key) {
+            if let size = expectedSize {
+                if metadata.contentInfo == nil {
+                    metadata.contentInfo = BMContentInfo(
+                        contentType: "video/mp4",
+                        contentLength: Int64(size),
+                        isByteRangeAccessSupported: true
+                    )
+                } else if metadata.contentInfo?.contentLength != Int64(size) {
+                    metadata.contentInfo?.contentLength = Int64(size)
+                }
+                
+                metadata.totalCachedSize = size
+            } else {
+                let fileSize = await getFileSizeForKey(key)
+                metadata.totalCachedSize = fileSize
+                
+                if metadata.contentInfo == nil {
+                    metadata.contentInfo = BMContentInfo(contentType: "video/mp4", contentLength: Int64(fileSize), isByteRangeAccessSupported: true)
+                }
+            }
+            
+            let verified = await verifyFileIntegrity(for: key, expectedSize: metadata.totalCachedSize)
+            if !verified {
+                BMLogger.shared.warning("文件完整性验证失败: \(key)")
+                metadata.isComplete = false
+            } else {
+                if !metadata.isComplete {
+                    metadata.isComplete = true
+                    metadata.lastAccessDate = Date()
+                    BMLogger.shared.debug("标记完成: \(key), 大小: \(metadata.totalCachedSize)")
+                }
+            }
+            
+            await metadataStore.set(metadata, for: key)
+            await saveMetadata(for: key)
+        } else {
+            BMLogger.shared.warning("未找到元数据: \(key)")
+        }
+    }
+
+    public func markComplete(for key: String) async {
+        await markComplete(for: key, expectedSize: nil)
+    }
+    
+    private func getFileSizeForKey(_ key: String) async -> UInt64 {
+        let fileURL = configuration.cacheFileURL(for: key)
+        
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            do {
+                let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+                if let size = attributes[.size] as? UInt64 {
+                    return size
+                }
+            } catch {
+                BMLogger.shared.error("获取文件大小失败: \(key)")
+            }
+        }
+        
         return 0
     }
-    private func updateStatistics() async {
-        var stats = BMCacheStatistics()
-        let allMetadata = await metadataStore.getAll()
-        stats.totalItemCount = allMetadata.count
-        stats.totalCacheSize = currentCacheSize
-        var oldestDate: Date? = nil
-        var newestDate: Date? = nil
-        var priorityCount: [CachePriority: Int] = [:]
-        var expiredCount = 0
-        var totalSize: UInt64 = 0
-        let now = Date()
-        for metadata in allMetadata.values {
-
-            if let oldest = oldestDate {
-                if metadata.lastAccessDate < oldest {
-                    oldestDate = metadata.lastAccessDate
-                }
-            } else {
-                oldestDate = metadata.lastAccessDate
-            }
-            if let newest = newestDate {
-                if metadata.lastAccessDate > newest {
-                    newestDate = metadata.lastAccessDate
-                }
-            } else {
-                newestDate = metadata.lastAccessDate
-            }
-
-            priorityCount[metadata.priority, default: 0] += 1
-
-            if let expirationDate = metadata.expirationDate, expirationDate < now {
-                expiredCount += 1
-            }
-
-            totalSize += UInt64(clamping: metadata.estimatedFileSizeBasedOnRanges)
+    
+    private func addToBatchBuffer(key: String, data: Data, offset: Int64) async {
+        if batchedWriteBuffer[key] == nil {
+            batchedWriteBuffer[key] = []
         }
-        stats.oldestItemDate = oldestDate
-        stats.newestItemDate = newestDate
-        stats.itemsByPriority = priorityCount
-        stats.expiredItemCount = expiredCount
-        stats.averageItemSize = allMetadata.count > 0 ? totalSize / UInt64(allMetadata.count) : 0
-
-        stats.hitCount = statistics.hitCount
-        stats.missCount = statistics.missCount
-
-        if configuration.maxCacheSizeInBytes > 0 {
-            stats.utilizationRate = Double(currentCacheSize) / Double(configuration.maxCacheSizeInBytes)
-        }
-
-        stats.totalPreloadRequests = statistics.totalPreloadRequests
-        stats.successfulPreloadRequests = statistics.successfulPreloadRequests
-
-        stats.lastCleanupTime = statistics.lastCleanupTime
-        stats.lastCleanupFreedBytes = statistics.lastCleanupFreedBytes
-        statistics = stats
+        
+        batchedWriteBuffer[key]?.append((offset: offset, data: data))
     }
-    func getStatistics() -> BMCacheStatistics {
-        return statistics
-    }
-    func setCachePriority(for url: URL, priority: CachePriority) async {
-        let key = cacheKey(for: url)
-        if var metadata = await metadataStore.get(key) {
-            metadata.priority = priority
-            await metadataStore.set(metadata, for: key)
-            await saveMetadata(for: key)
-            Task { await BMLogger.shared.debug("Set priority \(priority) for URL: \(url.absoluteString)") }
-        }
-    }
-    func setExpirationDate(for url: URL, date: Date?) async {
-        let key = cacheKey(for: url)
-        if var metadata = await metadataStore.get(key) {
-            metadata.expirationDate = date
-            await metadataStore.set(metadata, for: key)
-            await saveMetadata(for: key)
-            if let date = date {
-                Task { await BMLogger.shared.debug("Set expiration date \(date) for URL: \(url.absoluteString)") }
-            } else {
-                Task { await BMLogger.shared.debug("Removed expiration date for URL: \(url.absoluteString)") }
-            }
-        }
-    }
-
-    func clearLowPriorityCache() async {
-        Task { await BMLogger.shared.info("Clearing low priority cache due to memory pressure.") }
-
-        let lowPriorityKeys = await metadataStore.filter { _, metadata in metadata.priority == .low }
-        var freedSize: UInt64 = 0
-
-        for key in lowPriorityKeys {
-            if let metadata = await metadataStore.get(key) {
-
-                if dataLoaderManager?.isLoaderActive(forKey: key) == true {
-                    continue
-                }
-                let itemSize = UInt64(clamping: metadata.estimatedFileSizeBasedOnRanges)
-                freedSize += itemSize
-                await metadataStore.remove(key)
-                await fileHandleActor.removeHandle(forKey: key)
-
-                let cacheFileURL = self.configuration.cacheFileURL(for: key)
-                let metadataFileURL = self.configuration.metadataFileURL(for: key)
-                Task.detached {
-                    do {
-                        try FileManager.default.removeItem(at: cacheFileURL)
-                        try FileManager.default.removeItem(at: metadataFileURL)
-                    } catch {
-                        Task { await BMLogger.shared.error("Error deleting low priority files for key \(key): \(error)") }
-                    }
-                }
-            }
-        }
-        if freedSize > 0 {
-            currentCacheSize = (currentCacheSize >= freedSize) ? currentCacheSize - freedSize : 0
-            let localLowPriorityKeysCount = lowPriorityKeys.count
-            let localFreedSize = freedSize
-            Task { await BMLogger.shared.info("Cleared \(localLowPriorityKeysCount) low priority items, freed \(localFreedSize) bytes.") }
-        } else {
-            Task { await BMLogger.shared.info("No low priority items to clear.") }
-        }
-        await updateStatistics()
-    }
-
-    func clearNormalPriorityCache() async {
-        Task { await BMLogger.shared.info("Clearing normal priority cache due to high memory pressure.") }
-
-        let normalPriorityKeys = await metadataStore.filter { _, metadata in metadata.priority == .normal }
-        var freedSize: UInt64 = 0
-
-        for key in normalPriorityKeys {
-            if let metadata = await metadataStore.get(key) {
-
-                if dataLoaderManager?.isLoaderActive(forKey: key) == true {
-                    continue
-                }
-                let itemSize = UInt64(clamping: metadata.estimatedFileSizeBasedOnRanges)
-                freedSize += itemSize
-                await metadataStore.remove(key)
-                await fileHandleActor.removeHandle(forKey: key)
-
-                let cacheFileURL = self.configuration.cacheFileURL(for: key)
-                let metadataFileURL = self.configuration.metadataFileURL(for: key)
-                Task.detached {
-                    do {
-                        try FileManager.default.removeItem(at: cacheFileURL)
-                        try FileManager.default.removeItem(at: metadataFileURL)
-                    } catch {
-                        Task { await BMLogger.shared.error("Error deleting normal priority files for key \(key): \(error)") }
-                    }
-                }
-            }
-        }
-        if freedSize > 0 {
-            currentCacheSize = (currentCacheSize >= freedSize) ? currentCacheSize - freedSize : 0
-            let localNormalPriorityKeysCount = normalPriorityKeys.count
-            let localFreedSize = freedSize
-            Task { await BMLogger.shared.info("Cleared \(localNormalPriorityKeysCount) normal priority items, freed \(localFreedSize) bytes.") }
-        } else {
-            Task { await BMLogger.shared.info("No normal priority items to clear.") }
-        }
-        await updateStatistics()
-    }
-
-    func clearAllExceptActiveCache() async {
-        Task { await BMLogger.shared.warning("Clearing all except active cache due to critical memory pressure.") }
-
-        let allKeys = await metadataStore.filter { _, metadata in metadata.priority != .permanent }
-
-        if allKeys.isEmpty {
-            Task { await BMLogger.shared.info("No items to clear in critical cleanup.") }
+    
+    private func processBatchedWritesForKey(_ key: String, fileURL: URL) async {
+        guard let bufferEntries = batchedWriteBuffer[key], !bufferEntries.isEmpty else {
             return
         }
-
-        var keysToRemove = [String]()
-        var filesToRemove = [(URL, URL)]()
-        var freedSize: UInt64 = 0
-
-        for key in allKeys {
-
-            if dataLoaderManager?.isLoaderActive(forKey: key) == true {
-                continue
+        
+        // 创建目录（如果不存在）
+        do {
+            let directory = fileURL.deletingLastPathComponent()
+            if !FileManager.default.fileExists(atPath: directory.path) {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             }
-            if let metadata = await metadataStore.get(key) {
-                let itemSize = UInt64(clamping: metadata.estimatedFileSizeBasedOnRanges)
-                freedSize += itemSize
-                keysToRemove.append(key)
-                filesToRemove.append((configuration.cacheFileURL(for: key), configuration.metadataFileURL(for: key)))
-            }
-        }
-
-        if keysToRemove.isEmpty {
-            Task { await BMLogger.shared.info("No items to clear in critical cleanup.") }
+        } catch {
+            BMLogger.shared.error("创建缓存目录失败: \(error)")
             return
         }
-
-        await withTaskGroup(of: Void.self) { group in
-            for key in keysToRemove {
-                group.addTask { [weak self] in
-                    guard let self = self else { return }
-                    await self.metadataStore.remove(key)
-                    await self.fileHandleActor.removeHandle(forKey: key)
+        
+        do {
+            // 获取BMFileHandleManager实例
+            let fileHandleManager: BMFileHandleManager
+            do {
+                fileHandleManager = try await fileHandleActor.getHandle(forKey: key, createWith: fileURL)
+            } catch {
+                BMLogger.shared.error("获取文件句柄失败: \(key), \(error)")
+                return
+            }
+            
+            for entry in bufferEntries {
+                do {
+                    // 使用正确的文件句柄管理器方法写入数据
+                    await fileHandleManager.writeData(entry.data, at: entry.offset)
+                    
+                    // 更新缓存大小
+                    let dataSize = UInt64(entry.data.count)
+                    if dataSize > 0 {
+                        currentCacheSize += dataSize
+                    }
+                } catch {
+                    BMLogger.shared.error("写入数据块失败: \(key), 偏移量: \(entry.offset), 大小: \(entry.data.count), 错误: \(error)")
+                    // 继续处理其他块，而不是完全失败
+                    continue
                 }
             }
-        }
-
-
-        Task.detached { [filesToRemove] in
-            let fileManager = FileManager.default
-            for (cacheFileURL, metadataFileURL) in filesToRemove {
-
-                try? fileManager.removeItem(at: cacheFileURL)
-                try? fileManager.removeItem(at: metadataFileURL)
-
-                if filesToRemove.count > 10 {
-                    try? await Task.sleep(nanoseconds: 1_000_000)
-                }
-            }
-        }
-
-        currentCacheSize = (currentCacheSize >= freedSize) ? currentCacheSize - freedSize : 0
-        let localKeysToRemoveCount = keysToRemove.count
-        let localFreedSize = freedSize
-        Task { await BMLogger.shared.warning("Critical cleanup: cleared \(localKeysToRemoveCount) items, freed \(localFreedSize) bytes.") }
-
-        Task {
-            await self.updateStatistics()
+            
+            batchedWriteBuffer[key] = []
+            lastBatchedWriteTime[key] = Date().timeIntervalSince1970
+        } catch {
+            BMLogger.shared.error("批量写入数据失败: \(key), \(error)")
         }
     }
-    internal func merge(ranges: [ClosedRange<Int64>]) -> [ClosedRange<Int64>] {
-        guard ranges.count > 1 else { return ranges }
-        let sortedRanges = ranges.sorted { $0.lowerBound < $1.lowerBound }
-        var merged = [ClosedRange<Int64>]()
-        var currentMerge = sortedRanges[0]
-        for i in 1..<sortedRanges.count {
-            let nextRange = sortedRanges[i]
-            if currentMerge.upperBound + 1 >= nextRange.lowerBound {
-                currentMerge = currentMerge.lowerBound...max(currentMerge.upperBound, nextRange.upperBound)
-            } else {
-                merged.append(currentMerge)
-                currentMerge = nextRange
+    
+    private func processBatchedWrites() async {
+        let keys = Array(batchedWriteBuffer.keys)
+        
+        for key in keys {
+            let fileURL = configuration.cacheFileURL(for: key)
+            await processBatchedWritesForKey(key, fileURL: fileURL)
+        }
+    }
+    
+    private func verifyFileIntegrity(for key: String, expectedSize: UInt64) async -> Bool {
+        let fileURL = configuration.cacheFileURL(for: key)
+        
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return false
+        }
+        
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            guard let fileSize = attributes[.size] as? UInt64 else {
+                return false
+            }
+            
+            if fileSize != expectedSize {
+                return false
+            }
+            
+            let metadata = await metadataStore.get(key)
+            if metadata == nil || metadata?.isComplete == false {
+                return false
+            }
+            
+            return true
+        } catch {
+            BMLogger.shared.error("文件完整性验证失败: \(key), \(error)")
+            return false
+        }
+    }
+
+
+    // MARK: - Specific Cache Clearing (Placeholders)
+    public func clearLowPriorityCache() async {
+        BMLogger.shared.info("Clearing low priority cache due to memory pressure.")
+
+        // 获取所有元数据
+        let allMetadata = await metadataStore.getAllValues()
+        var removedCount = 0
+
+        // 清除低优先级的缓存项
+        for metadata in allMetadata {
+            if metadata.priority == .low {
+                let key = metadata.cacheKey
+                let removed = await removeCache(for: key)
+                if removed {
+                    removedCount += 1
+                }
             }
         }
-        merged.append(currentMerge)
-        return merged
+
+        if removedCount == 0 {
+            BMLogger.shared.info("No low priority items to clear.")
+        }
+
+        // 更新缓存统计信息
+        BMLogger.shared.debug("Updating statistics - Current size: \(currentCacheSize), Total size from metadata: \(allMetadata.reduce(UInt64(0)) { $0 + $1.totalCachedSize })")
+    }
+
+    public func clearNormalPriorityCache() async {
+        BMLogger.shared.info("Clearing normal priority cache due to high memory pressure.")
+
+        // 获取所有元数据
+        let allMetadata = await metadataStore.getAllValues()
+        var removedCount = 0
+
+        // 清除普通优先级的缓存项
+        for metadata in allMetadata {
+            if metadata.priority == .normal && !metadata.isComplete {
+                let key = metadata.cacheKey
+                let removed = await removeCache(for: key)
+                if removed {
+                    removedCount += 1
+                }
+            }
+        }
+
+        // 更新缓存统计信息
+        BMLogger.shared.debug("Updating statistics - Current size: \(currentCacheSize), Total size from metadata: \(allMetadata.reduce(UInt64(0)) { $0 + $1.totalCachedSize })")
+
+        if removedCount == 0 {
+            BMLogger.shared.info("No normal priority items to clear.")
+        }
+    }
+
+    // MARK: - Cache Eviction (Placeholder)
+    private func _checkCacheSizeLimit(maxSizeBytes: UInt64) async {
+        if currentCacheSize > maxSizeBytes {
+            BMLogger.shared.info("Cache size limit exceeded (\(currentCacheSize) / \(maxSizeBytes)). Start eviction...")
+            // LRU淘汰：按lastAccessDate排序
+            let allMetadata = await metadataStore.getAllValues()
+            let sorted = allMetadata.sorted { $0.lastAccessDate < $1.lastAccessDate }
+            for meta in sorted {
+                if currentCacheSize <= maxSizeBytes { break }
+                let key = meta.cacheKey
+                let removed = await removeCache(for: key)
+                if removed {
+                    BMLogger.shared.debug("Evicted cache for key: \(key)")
+                }
+            }
+            BMLogger.shared.info("Cache eviction complete. Current size: \(currentCacheSize)")
+        }
+    }
+
+    // 新增：专门用于设置回调的方法，运行在 BMCacheManager actor 上下文中
+    public func setOnProgressCallback(_ callback: ((String, URL, Double, UInt64, UInt64) -> Void)?) async {
+        BMLogger.shared.debug("[BMCacheManager] setOnProgressCallback called. Callback is nil? \(callback == nil)")
+        self.onProgress = callback
+        BMLogger.shared.debug("[BMCacheManager] self.onProgress assigned. Is nil now? \(self.onProgress == nil)")
     }
 }

@@ -15,9 +15,9 @@ and flexible cache cleanup strategies.
   # 在本地验证时使用本地路径
   s.source           = { :git => '.', :tag => s.version.to_s }
 
-  s.ios.deployment_target = '14.0'
-  s.osx.deployment_target = '14.0'
-  s.tvos.deployment_target = '14.0'
+  s.ios.deployment_target = '15.0'
+  s.osx.deployment_target = '15.0'
+  s.tvos.deployment_target = '15.0'
   s.visionos.deployment_target = '1.0'
   s.swift_version = '5.0'
 

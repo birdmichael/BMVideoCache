@@ -6,8 +6,8 @@ import PackageDescription
 let package = Package(
     name: "BMVideoCache",
     platforms: [
-        .iOS(.v14),
-        .macOS(.v14),
+        .iOS(.v15),
+        .macOS(.v15),
         .tvOS(.v14),
         .visionOS(.v1)
     ],

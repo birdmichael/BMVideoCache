@@ -67,6 +67,13 @@ actor BMFileOperationBatcher {
             await Task.yield()
 
             do {
+                // 确保缓存文件目录存在
+                let cacheDir = filePair.cacheFile.deletingLastPathComponent()
+                if !FileManager.default.fileExists(atPath: cacheDir.path) {
+                    try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+                    BMLogger.shared.debug("Created cache directory for batch deletion: \(cacheDir.path)")
+                }
+
                 if FileManager.default.fileExists(atPath: filePair.cacheFile.path) {
                     try FileManager.default.removeItem(at: filePair.cacheFile)
                     deletedCount += 1
@@ -80,12 +87,12 @@ actor BMFileOperationBatcher {
                 }
             } catch {
                 errorCount += 1
-                await BMLogger.shared.error("Error deleting files for key \(filePair.key): \(error)")
+                BMLogger.shared.error("Error deleting files for key \(filePair.key): \(error)")
             }
         }
 
         if deletedCount > 0 || errorCount > 0 {
-            await BMLogger.shared.debug("Batch file deletion: processed \(currentBatch.count) items, deleted \(deletedCount) files, \(errorCount) errors")
+            BMLogger.shared.debug("Batch file deletion: processed \(currentBatch.count) items, deleted \(deletedCount) files, \(errorCount) errors")
         }
 
         isProcessingDeletions = false

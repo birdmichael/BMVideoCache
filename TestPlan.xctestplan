@@ -1,0 +1,18 @@
+{
+  "configurations" : [
+
+  ],
+  "defaultOptions" : {
+    "testTimeoutsEnabled" : true
+  },
+  "testTargets" : [
+    {
+      "target" : {
+        "containerPath" : "container:",
+        "identifier" : "BMVideoCacheTests",
+        "name" : "BMVideoCacheTests"
+      }
+    }
+  ],
+  "version" : 1
+}
